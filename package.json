@@ -1,0 +1,23 @@
+{
+  "name": "mesina-unified-support",
+  "version": "1.02",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "check": "node --check src/server.js && node --check public/app.js && node --check public/widget.js"
+  },
+  "dependencies": {
+    "express-openid-connect": "^2.17.1",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-session": "^1.18.1",
+    "helmet": "^8.0.0",
+    "imapflow": "^1.0.181",
+    "nodemailer": "^6.10.0",
+    "pg": "^8.13.1",
+    "uuid": "^11.0.5",
+    "mailparser": "^3.7.2"
+  }
+}

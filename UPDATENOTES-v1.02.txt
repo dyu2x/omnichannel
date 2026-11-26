@@ -1,0 +1,31 @@
+MESINA FARMS UNIFIED SUPPORT — v1.02
+Email integration: IMAP / SMTP
+
+Based on the supplied v1.01.6 fresh-install package.
+
+Included:
+- IMAP mailbox configuration with host, port, TLS, username, password and folder.
+- SMTP configuration with host, port, STARTTLS / implicit TLS, username and password.
+- AES-256-GCM encrypted mailbox credentials.
+- Add, edit, enable/disable and remove mailbox accounts.
+- IMAP mailbox access and SMTP transport verification.
+- Manual mailbox synchronization and visible sync logs / last error.
+- Per-mailbox polling interval (60–3600 seconds).
+- Inbound email de-duplication using UIDVALIDITY/UID and Internet Message-ID.
+- Email replies use the mailbox that received the conversation when possible.
+- RFC email thread headers (In-Reply-To and References) on replies.
+- Sender display name and configurable Reply-To address.
+- Inbound and outbound email attachments (up to 10 files / 20 MB per outbound message).
+- Authenticated attachment download, protected by conversation access checks.
+- Additive database migration runs during startup; standalone migration included at:
+  db/migrations/1.02_email_integration.sql
+- Existing ZITADEL auth, roles, contacts, conversations, assignment, WhatsApp, live chat and Docker volumes retained.
+
+Upgrade:
+1. Back up PostgreSQL.
+2. Extract the package over the existing application directory, preserving .env.
+3. Rebuild with docker compose build --no-cache app.
+4. Restart with docker compose up -d --force-recreate app.
+5. Check docker compose logs --tail=150 app.
+
+Do not run docker compose down -v.
