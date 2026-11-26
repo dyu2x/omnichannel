@@ -1,6 +1,6 @@
 {
   "name": "mesina-unified-support",
-  "version": "1.02",
+  "version": "1.02.1",
   "private": true,
   "type": "module",
   "scripts": {

@@ -10,7 +10,7 @@ const require = createRequire(import.meta.url);
 const { auth } = require('express-openid-connect');
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
 import { simpleParser } from 'mailparser';
@@ -28,26 +28,6 @@ const key = Buffer.from(process.env.ENCRYPTION_KEY || '', 'base64');
 if (key.length !== 32) console.warn('WARNING: ENCRYPTION_KEY must decode to exactly 32 bytes. Integration settings cannot be saved safely until configured.');
 const encrypt = (value) => { if (!key.length || !value) throw new Error('Set a valid 32-byte ENCRYPTION_KEY'); const iv=crypto.randomBytes(12); const c=crypto.createCipheriv('aes-256-gcm',key,iv); const data=Buffer.concat([c.update(value,'utf8'),c.final()]); return [iv.toString('base64'),c.getAuthTag().toString('base64'),data.toString('base64')].join('.'); };
 const decrypt = (value) => { const [iv,tag,data]=value.split('.'); const d=crypto.createDecipheriv('aes-256-gcm',key,Buffer.from(iv,'base64')); d.setAuthTag(Buffer.from(tag,'base64')); return Buffer.concat([d.update(Buffer.from(data,'base64')),d.final()]).toString('utf8'); };
-const emailUploadDir=path.resolve('/app/uploads/email');
-async function persistEmailAttachment(messageId,fileName,mimeType,content,db=pool){
- const safe=String(fileName||'attachment').replace(/[^a-zA-Z0-9._() -]/g,'_').slice(0,140)||'attachment';
- await mkdir(emailUploadDir,{recursive:true});
- const stored=`${uuidv4()}-${safe}`,target=path.join(emailUploadDir,stored);
- await writeFile(target,content,{flag:'wx'});
- const size=Buffer.isBuffer(content)?content.length:Buffer.byteLength(content);
- const row=(await db.query(`INSERT INTO message_attachments(message_id,file_name,mime_type,storage_path,size_bytes)
- VALUES($1,$2,$3,$4,$5) RETURNING id,file_name,mime_type,size_bytes`,[messageId,safe,mimeType||'application/octet-stream',target,size])).rows[0];
- return {...row,path:target};
-}
-
-const smtpTransport = account => nodemailer.createTransport({
- host:account.smtp_host, port:Number(account.smtp_port||587),
- secure:Number(account.smtp_port||587)===465,
- requireTLS:Boolean(account.smtp_tls)&&Number(account.smtp_port||587)!==465,
- tls:{rejectUnauthorized:true}, auth:{user:account.smtp_user,pass:decrypt(account.smtp_secret_enc)},
- connectionTimeout:15000,greetingTimeout:15000,socketTimeout:30000
-});
-
 app.set('trust proxy', 1);
 app.use(helmet({contentSecurityPolicy:{directives:{defaultSrc:["'self'"],scriptSrc:["'self'","https://connect.facebook.net"],styleSrc:["'self'","'unsafe-inline'"],imgSrc:["'self'","data:","https:"],connectSrc:["'self'","https:"],fontSrc:["'self'","data:"]}}}));
 app.use(express.json({limit:'50mb',verify:(req,res,buf)=>{req.rawBody=Buffer.from(buf);}}));
@@ -83,18 +63,8 @@ if (oidcReady) app.use(auth({
 else app.use((req,res,next)=>{req.oidc={isAuthenticated:()=>false};next();});
 app.use('/widget.js', express.static(path.join(__dirname,'../public/widget.js')));
 app.use('/assets', express.static(path.join(__dirname,'../public')));
-app.get('/api/version',(req,res)=>res.json({version:'1.02',name:'Mesina Farms Unified Support'}));
-app.get('/health', async (_req,res)=>{try{await pool.query(`ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS from_name text;
-  ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS reply_to text;
-  ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS sync_interval_seconds int NOT NULL DEFAULT 60;
-  ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS last_sync_at timestamptz;
-  ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS last_sync_error text;
-  ALTER TABLE email_messages ADD COLUMN IF NOT EXISTS internet_message_id text;
-  ALTER TABLE email_messages ADD COLUMN IF NOT EXISTS in_reply_to text;
-  ALTER TABLE email_messages ADD COLUMN IF NOT EXISTS references_header text;
-  CREATE INDEX IF NOT EXISTS email_messages_internet_id_idx ON email_messages(internet_message_id);
-  CREATE INDEX IF NOT EXISTS email_messages_thread_idx ON email_messages(account_id,in_reply_to);`);
-await pool.query('SELECT 1');res.json({ok:true,database:'connected',oidc:oidcReady});}catch(e){res.status(503).json({ok:false,error:'database unavailable'});}});
+app.get('/api/version',(req,res)=>res.json({version:'1.02.0',name:'Mesina Farms Unified Support'}));
+app.get('/health', async (_req,res)=>{try{await pool.query('SELECT 1');res.json({ok:true,database:'connected',oidc:oidcReady});}catch(e){res.status(503).json({ok:false,error:'database unavailable'});}});
 app.get('/webhooks/whatsapp', async (req,res)=>{const mode=req.query['hub.mode'];const token=req.query['hub.verify_token'];const challenge=req.query['hub.challenge'];try{const q=await pool.query('SELECT verify_token_enc FROM whatsapp_accounts WHERE enabled=true');const valid=q.rows.some(r=>decrypt(r.verify_token_enc)===token);if(mode==='subscribe'&&valid)return res.status(200).send(challenge);}catch(e){console.error('Webhook verify:',e.message);}res.sendStatus(403);});
 app.post('/webhooks/whatsapp', async (req,res)=>{try{for(const entry of req.body.entry||[])for(const change of entry.changes||[]){const metadata=change.value?.metadata||{};const acct=(await pool.query('SELECT * FROM whatsapp_accounts WHERE phone_number_id=$1 AND enabled=true',[metadata.phone_number_id])).rows[0];if(acct?.app_secret_enc){const signature=String(req.headers['x-hub-signature-256']||'');const expected='sha256='+crypto.createHmac('sha256',decrypt(acct.app_secret_enc)).update(req.rawBody||Buffer.from('')).digest('hex');if(!signature||signature.length!==expected.length||!crypto.timingSafeEqual(Buffer.from(signature),Buffer.from(expected)))return res.sendStatus(401);}}res.sendStatus(200);await pool.query('INSERT INTO webhook_events(provider,payload) VALUES($1,$2)', ['whatsapp',req.body]);for(const entry of req.body.entry||[])for(const change of entry.changes||[]){const value=change.value||{};const metadata=value.metadata||{};const acct=(await pool.query('SELECT * FROM whatsapp_accounts WHERE phone_number_id=$1 AND enabled=true',[metadata.phone_number_id])).rows[0];for(const m of value.messages||[]){const from=m.from;let contact=(await pool.query('SELECT * FROM contacts WHERE phone=$1',[from])).rows[0];if(!contact)contact=(await pool.query('INSERT INTO contacts(name,phone) VALUES($1,$2) RETURNING *',[value.contacts?.[0]?.profile?.name||from,from])).rows[0];let conv=(await pool.query("SELECT * FROM conversations WHERE contact_id=$1 AND channel='whatsapp' AND status IN ('open','pending') ORDER BY updated_at DESC LIMIT 1",[contact.id])).rows[0];if(!conv)conv=(await pool.query("INSERT INTO conversations(contact_id,channel,subject) VALUES($1,'whatsapp',$2) RETURNING *",[contact.id,'WhatsApp conversation'])).rows[0];const body=m.text?.body||m.button?.text||m.interactive?.button_reply?.title||`[${m.type||'unsupported'} message]`;const msg=(await pool.query("INSERT INTO messages(conversation_id,channel,direction,sender_name,sender_address,body_text,provider_message_id,raw_payload) VALUES($1,'whatsapp','inbound',$2,$3,$4,$5,$6) ON CONFLICT(channel,provider_message_id) DO NOTHING RETURNING id",[conv.id,contact.name,from,body,m.id, m])).rows[0];if(msg&&acct)await pool.query('INSERT INTO whatsapp_messages(message_id,account_id,wa_message_id,wa_from,message_type) VALUES($1,$2,$3,$4,$5) ON CONFLICT(wa_message_id) DO NOTHING',[msg.id,acct.id,m.id,from,m.type]);await pool.query('UPDATE conversations SET last_message_at=now(),updated_at=now() WHERE id=$1',[conv.id]);}for(const s of value.statuses||[])await pool.query('INSERT INTO whatsapp_message_statuses(wa_message_id,status,event_timestamp,recipient_id,payload) VALUES($1,$2,to_timestamp($3),$4,$5)',[s.id,s.status,Number(s.timestamp||0),s.recipient_id,s]);}}catch(e){console.error('WhatsApp webhook processing:',e);}});
 const requireLogin=(req,res,next)=>{if(!oidcReady)return res.status(503).json({error:'ZITADEL is not configured. Set ZITADEL_CLIENT_ID and ZITADEL_CLIENT_SECRET.'});if(!req.oidc?.isAuthenticated?.())return res.status(401).json({error:'Authentication required'});next();};
@@ -217,18 +187,6 @@ app.get('/api/conversations',requireLogin,api(async req=>{
     ${where.length?'WHERE '+where.join(' AND '):''} ORDER BY coalesce(c.last_message_at,c.updated_at) DESC LIMIT 500`;
   return (await pool.query(sql,args)).rows;
 }));
-app.get('/api/attachments/:id',requireLogin,async(req,res,next)=>{
- try{
-  const row=(await pool.query(`SELECT a.*,m.conversation_id FROM message_attachments a JOIN messages m ON m.id=a.message_id WHERE a.id=$1`,[req.params.id])).rows[0];
-  if(!row)return res.status(404).json({error:'Attachment not found'});
-  await assertConversationAccess(req,row.conversation_id);
-  const base=path.resolve('/app/uploads/email')+path.sep, target=path.resolve(row.storage_path);
-  if(!target.startsWith(base))return res.status(403).json({error:'Invalid attachment path'});
-  res.setHeader('Content-Type',row.mime_type||'application/octet-stream');
-  res.setHeader('Content-Disposition',`attachment; filename="${String(row.file_name||'attachment').replace(/["\\\\\r\n]/g,'_')}"`);
-  res.sendFile(target);
- }catch(e){next(e);}
-});
 app.get('/api/conversations/:id',requireLogin,api(async req=>{
   await assertConversationAccess(req,req.params.id);
   const row=(await pool.query(`SELECT c.*,co.name contact_name,co.email contact_email,co.phone contact_phone,co.company contact_company,
@@ -237,10 +195,7 @@ app.get('/api/conversations/:id',requireLogin,api(async req=>{
     FROM conversations c LEFT JOIN contacts co ON co.id=c.contact_id LEFT JOIN users u ON u.id=c.assigned_user_id LEFT JOIN teams t ON t.id=c.assigned_team_id WHERE c.id=$1`,[req.params.id])).rows[0];
   if(!row)throw Object.assign(new Error('Conversation not found'),{status:404});
   const [messages,notes,events,assignments,tags]=await Promise.all([
-    pool.query(`SELECT m.*,u.display_name created_by_name,u.avatar_url created_by_avatar,
-    COALESCE((SELECT json_agg(json_build_object('id',a.id,'file_name',a.file_name,'mime_type',a.mime_type,'size_bytes',a.size_bytes) ORDER BY a.created_at)
-      FROM message_attachments a WHERE a.message_id=m.id),'[]'::json) attachments
-    FROM messages m LEFT JOIN users u ON u.id=m.created_by WHERE m.conversation_id=$1 ORDER BY m.created_at`,[req.params.id]),
+    pool.query("SELECT m.*,u.display_name created_by_name,u.avatar_url created_by_avatar,COALESCE((SELECT json_agg(json_build_object('id',a.id,'file_name',a.file_name,'mime_type',a.mime_type,'size_bytes',a.size_bytes)) FROM message_attachments a WHERE a.message_id=m.id),'[]'::json) attachments FROM messages m LEFT JOIN users u ON u.id=m.created_by WHERE m.conversation_id=$1 ORDER BY m.created_at",[req.params.id]),
     pool.query('SELECT n.*,u.display_name author_name,u.avatar_url author_avatar FROM conversation_notes n LEFT JOIN users u ON u.id=n.author_user_id WHERE n.conversation_id=$1 ORDER BY n.created_at',[req.params.id]),
     pool.query('SELECT e.*,u.display_name actor_name FROM conversation_events e LEFT JOIN users u ON u.id=e.actor_user_id WHERE e.conversation_id=$1 ORDER BY e.created_at DESC LIMIT 100',[req.params.id]),
     pool.query('SELECT a.*,f.display_name from_name,to_u.display_name to_name,by_u.display_name assigned_by_name FROM conversation_assignments a LEFT JOIN users f ON f.id=a.from_user_id LEFT JOIN users to_u ON to_u.id=a.to_user_id LEFT JOIN users by_u ON by_u.id=a.assigned_by WHERE a.conversation_id=$1 ORDER BY a.created_at DESC',[req.params.id]),
@@ -248,6 +203,18 @@ app.get('/api/conversations/:id',requireLogin,api(async req=>{
   ]);
   return {conversation:row,messages:messages.rows,notes:notes.rows,events:events.rows,assignments:assignments.rows,tags:tags.rows};
 }));
+app.get('/api/attachments/:id',requireLogin,async(req,res)=>{
+ try{
+  const row=(await pool.query('SELECT a.*,m.conversation_id FROM message_attachments a JOIN messages m ON m.id=a.message_id WHERE a.id=$1',[req.params.id])).rows[0];
+  if(!row)return res.status(404).json({error:'Attachment not found'});
+  await assertConversationAccess(req,row.conversation_id);
+  if(!row.content)return res.status(404).json({error:'Attachment content unavailable'});
+  res.setHeader('Content-Type',row.mime_type||'application/octet-stream');
+  res.setHeader('Content-Disposition',`attachment; filename*=UTF-8''${encodeURIComponent(row.file_name||'attachment')}`);
+  res.setHeader('X-Content-Type-Options','nosniff');
+  return res.send(row.content);
+ }catch(e){return res.status(e.status||403).json({error:e.message||'Unable to retrieve attachment'});}
+});
 app.get('/api/conversations/:id/messages',requireLogin,api(async req=>{await assertConversationAccess(req,req.params.id);return (await pool.query('SELECT * FROM messages WHERE conversation_id=$1 ORDER BY created_at',[req.params.id])).rows;}));
 app.post('/api/conversations/:id/claim',requireLogin,api(async req=>{
   const {user,allowed}=await access(req,'conversation.claim');if(!allowed)throw Object.assign(new Error('Permission denied'),{status:403});
@@ -322,123 +289,56 @@ app.delete('/api/teams/:id',requireLogin,api(async req=>{const {user,allowed}=aw
 app.get('/api/agents',requireLogin,api(async req=>{const {user}=await access(req,'inbox.view');const roles=await pool.query('SELECT r.name FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=$1',[user.id]);return {agents:(await pool.query('SELECT u.id,u.display_name,u.email,u.avatar_url,u.given_name,u.family_name,u.nickname,u.preferred_username,u.phone_number,u.phone_number_verified,u.email_verified,u.profile_url,u.website,u.locale,u.zoneinfo,u.address,u.is_active,u.first_login_at,u.last_login_at,u.is_online,array_agg(r.name) FILTER(WHERE r.name IS NOT NULL) roles FROM users u LEFT JOIN user_roles ur ON ur.user_id=u.id LEFT JOIN roles r ON r.id=ur.role_id GROUP BY u.id ORDER BY u.display_name')).rows,available_roles:(await pool.query('SELECT name FROM roles ORDER BY CASE name WHEN \'Super Admin\' THEN 1 WHEN \'Admin\' THEN 2 WHEN \'Manager\' THEN 3 ELSE 4 END')).rows.map(x=>x.name),can_manage:roles.rows.some(x=>['Super Admin','Admin'].includes(x.name)),is_super_admin:roles.rows.some(x=>x.name==='Super Admin')};}));
 app.put('/api/agents/:id/roles',requireLogin,api(async req=>{const {user}=await access(req,'inbox.view');const actorRoles=(await pool.query('SELECT r.name FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=$1',[user.id])).rows.map(x=>x.name);const isSuper=actorRoles.includes('Super Admin');const isAdmin=actorRoles.includes('Admin');if(!isSuper&&!isAdmin)throw Object.assign(new Error('Permission denied'),{status:403});if(!isSuper){if(req.params.id===user.id)throw Object.assign(new Error('Admins cannot change their own roles.'),{status:403});const targetRoles=(await pool.query('SELECT r.name FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=$1',[req.params.id])).rows.map(x=>x.name);if(targetRoles.some(x=>['Super Admin','Admin'].includes(x)))throw Object.assign(new Error('Only a Super Admin can modify an Admin or Super Admin account.'),{status:403});}const names=[...new Set((Array.isArray(req.body.roles)?req.body.roles:[]).map(x=>String(x)))];if(!names.length)throw new Error('At least one role must be assigned');if(names.some(x=>!['Super Admin','Admin','Manager','Agent'].includes(x)))throw new Error('Unknown role');if(!isSuper&&names.some(x=>['Super Admin','Admin'].includes(x)))throw Object.assign(new Error('Admins cannot assign the Super Admin or Admin role.'),{status:403});if(req.params.id===user.id&&!isSuper&&names.some(x=>!['Admin','Manager','Agent'].includes(x)))throw Object.assign(new Error('You cannot assign this role.'),{status:403});const client=await pool.connect();try{await client.query('BEGIN');const exists=await client.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[req.params.id]);if(!exists.rowCount)throw Object.assign(new Error('Agent not found'),{status:404});await client.query('DELETE FROM user_roles WHERE user_id=$1',[req.params.id]);for(const name of names)await client.query('INSERT INTO user_roles(user_id,role_id,assigned_by) SELECT $1,id,$2 FROM roles WHERE name=$3',[req.params.id,user.id,name]);await client.query('COMMIT');}catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}await pool.query("INSERT INTO audit_logs(actor_user_id,action,entity_type,entity_id,after_data) VALUES($1,'agent.roles_updated','agent',$2,$3)",[user.id,req.params.id,{roles:names}]);return {ok:true};}));
 app.put('/api/agents/:id/active',requireLogin,api(async req=>{const {user}=await access(req,'inbox.view');const actorRoles=(await pool.query('SELECT r.name FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=$1',[user.id])).rows.map(x=>x.name);if(!actorRoles.some(x=>['Super Admin','Admin'].includes(x)))throw Object.assign(new Error('Permission denied'),{status:403});const active=Boolean(req.body.is_active);if(!actorRoles.includes('Super Admin')){const targetRoles=(await pool.query('SELECT r.name FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=$1',[req.params.id])).rows.map(x=>x.name);if(targetRoles.some(x=>['Super Admin','Admin'].includes(x)))throw Object.assign(new Error('Only a Super Admin can change the active status of an Admin or Super Admin account.'),{status:403});}if(req.params.id===user.id&&!active)throw Object.assign(new Error('You cannot deactivate your own account.'),{status:400});const row=(await pool.query('UPDATE users SET is_active=$2,updated_at=now() WHERE id=$1 RETURNING id,is_active',[req.params.id,active])).rows[0];if(!row)throw Object.assign(new Error('Agent not found'),{status:404});await pool.query("INSERT INTO audit_logs(actor_user_id,action,entity_type,entity_id,after_data) VALUES($1,'agent.active_updated','agent',$2,$3)",[user.id,row.id,row]);return row;}));
-app.post('/api/conversations/:id/reply',requireLogin,api(async req=>{const {user,allowed}=await access(req,'conversation.reply');if(!allowed)throw Object.assign(new Error('Permission denied'),{status:403});await assertConversationAccess(req,req.params.id);const body=String(req.body.body||'').trim();if(!body)throw new Error('Message cannot be empty');
- const requestedAttachments=Array.isArray(req.body.attachments)?req.body.attachments:[];
- if(requestedAttachments.length>10)throw Object.assign(new Error('Maximum 10 attachments per email'),{status:400});
- let totalAttachmentBytes=0;
- const decodedAttachments=requestedAttachments.map(a=>{const content=Buffer.from(String(a.content_base64||''),'base64');totalAttachmentBytes+=content.length;if(!a.file_name||!content.length)throw Object.assign(new Error('Invalid email attachment'),{status:400});return {file_name:String(a.file_name).slice(0,140),mime_type:String(a.mime_type||'application/octet-stream'),content};});
- if(totalAttachmentBytes>20*1024*1024)throw Object.assign(new Error('Total email attachments cannot exceed 20 MB'),{status:400});
- const c=(await pool.query('SELECT * FROM conversations WHERE id=$1',[req.params.id])).rows[0];if(!c)throw new Error('Conversation not found');if(decodedAttachments.length&&c.channel!=='email')throw Object.assign(new Error('File attachments are currently supported for email conversations only'),{status:400});const msg=(await pool.query("INSERT INTO messages(conversation_id,channel,direction,body_text,created_by) VALUES($1,$2,'outbound',$3,$4) RETURNING *",[c.id,c.channel,body,user.id])).rows[0];if(c.channel==='whatsapp'){const acct=(await pool.query('SELECT * FROM whatsapp_accounts WHERE enabled=true ORDER BY created_at LIMIT 1')).rows[0];if(!acct)throw new Error('No enabled WhatsApp account');const token=decrypt(acct.access_token_enc);const url=`https://graph.facebook.com/${acct.graph_api_version}/${acct.phone_number_id}/messages`;const contact=(await pool.query('SELECT phone FROM contacts WHERE id=$1',[c.contact_id])).rows[0];const r=await fetch(url,{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({messaging_product:'whatsapp',to:contact.phone,type:'text',text:{body}})});const data=await r.json();if(!r.ok)throw new Error(data.error?.message||'WhatsApp send failed');await pool.query('UPDATE messages SET provider_message_id=$2,raw_payload=$3 WHERE id=$1',[msg.id,data.messages?.[0]?.id||null,data]);await pool.query('INSERT INTO whatsapp_messages(message_id,account_id,wa_message_id,wa_from,message_type,status) VALUES($1,$2,$3,$4,$5,$6)',[msg.id,acct.id,data.messages?.[0]?.id,contact.phone,'text','sent']);}else if(c.channel==='email'){
+app.post('/api/conversations/:id/reply',requireLogin,api(async req=>{const {user,allowed}=await access(req,'conversation.reply');if(!allowed)throw Object.assign(new Error('Permission denied'),{status:403});await assertConversationAccess(req,req.params.id);const body=String(req.body.body||'').trim();if(!body)throw new Error('Message cannot be empty');const c=(await pool.query('SELECT * FROM conversations WHERE id=$1',[req.params.id])).rows[0];if(!c)throw new Error('Conversation not found');const msg=(await pool.query("INSERT INTO messages(conversation_id,channel,direction,body_text,created_by) VALUES($1,$2,'outbound',$3,$4) RETURNING *",[c.id,c.channel,body,user.id])).rows[0];if(c.channel==='whatsapp'){const acct=(await pool.query('SELECT * FROM whatsapp_accounts WHERE enabled=true ORDER BY created_at LIMIT 1')).rows[0];if(!acct)throw new Error('No enabled WhatsApp account');const token=decrypt(acct.access_token_enc);const url=`https://graph.facebook.com/${acct.graph_api_version}/${acct.phone_number_id}/messages`;const contact=(await pool.query('SELECT phone FROM contacts WHERE id=$1',[c.contact_id])).rows[0];const r=await fetch(url,{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({messaging_product:'whatsapp',to:contact.phone,type:'text',text:{body}})});const data=await r.json();if(!r.ok)throw new Error(data.error?.message||'WhatsApp send failed');await pool.query('UPDATE messages SET provider_message_id=$2,raw_payload=$3 WHERE id=$1',[msg.id,data.messages?.[0]?.id||null,data]);await pool.query('INSERT INTO whatsapp_messages(message_id,account_id,wa_message_id,wa_from,message_type,status) VALUES($1,$2,$3,$4,$5,$6)',[msg.id,acct.id,data.messages?.[0]?.id,contact.phone,'text','sent']);}else if(c.channel==='email'){
  const contact=(await pool.query('SELECT email,name FROM contacts WHERE id=$1',[c.contact_id])).rows[0];
- if(!contact?.email)throw new Error('This contact does not have an email address');
- const inbound=(await pool.query(`SELECT em.account_id,em.internet_message_id FROM email_messages em JOIN messages m ON m.id=em.message_id
- WHERE m.conversation_id=$1 AND m.direction='inbound' AND em.account_id IS NOT NULL ORDER BY m.created_at DESC LIMIT 1`,[c.id])).rows[0];
- let acct=inbound?.account_id?(await pool.query('SELECT * FROM email_accounts WHERE id=$1 AND enabled=true',[inbound.account_id])).rows[0]:null;
- if(!acct)acct=(await pool.query('SELECT * FROM email_accounts WHERE enabled=true ORDER BY created_at LIMIT 1')).rows[0];
- if(!acct)throw new Error('No enabled email account is available for this conversation');
- const transporter=smtpTransport(acct);
- const subject=String(c.subject||'Support request');
- const replySubject=/^\s*re:/i.test(subject)?subject:`Re: ${subject}`;
- const priorIds=(await pool.query(`SELECT em.internet_message_id FROM email_messages em JOIN messages m ON m.id=em.message_id
- WHERE m.conversation_id=$1 AND em.internet_message_id IS NOT NULL ORDER BY m.created_at`,[c.id])).rows.map(x=>x.internet_message_id);
- const refs=priorIds.filter(Boolean).slice(-20);
- let info;
- try{
-  info=await transporter.sendMail({from:acct.from_name?{name:acct.from_name,address:acct.email_address}:acct.email_address,
-   to:contact.email,replyTo:acct.reply_to||acct.email_address,subject:replySubject,text:body,
-   attachments:decodedAttachments.map(a=>({filename:a.file_name,content:a.content,contentType:a.mime_type})),
-   ...(inbound?.internet_message_id?{inReplyTo:inbound.internet_message_id}:{}),...(refs.length?{references:refs}:{})});
- }catch(sendError){
-  await pool.query("UPDATE messages SET provider_status='failed',raw_payload=$2 WHERE id=$1",[msg.id,{error:sendError.message}]).catch(()=>{});
-  throw sendError;
- }finally{transporter.close();}
- await pool.query("INSERT INTO email_messages(message_id,account_id,internet_message_id,in_reply_to,references_header,from_address,to_addresses,subject) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
- [msg.id,acct.id,info.messageId||null,inbound?.internet_message_id||null,refs.join(' ')||null,acct.email_address,[contact.email],replySubject]);
- await pool.query('UPDATE messages SET provider_message_id=$2,provider_status=$3 WHERE id=$1',[msg.id,info.messageId,'sent']);
- for(const attachment of decodedAttachments)await persistEmailAttachment(msg.id,attachment.file_name,attachment.mime_type,attachment.content);
+ if(!contact?.email)throw new Error('This contact does not have an email address.');
+ const prior=(await pool.query(`SELECT em.account_id,em.internet_message_id,em.references_header
+   FROM email_messages em JOIN messages m ON m.id=em.message_id
+   WHERE m.conversation_id=$1 AND em.account_id IS NOT NULL
+   ORDER BY m.created_at DESC LIMIT 1`,[c.id])).rows[0];
+ const acct=(prior?.account_id
+   ? (await pool.query('SELECT * FROM email_accounts WHERE id=$1 AND enabled=true',[prior.account_id])).rows[0]
+   : null) || (await pool.query('SELECT * FROM email_accounts WHERE enabled=true ORDER BY created_at LIMIT 1')).rows[0];
+ if(!acct)throw new Error('No enabled email account is available for this conversation.');
+ const secure=Boolean(acct.smtp_port===465 && acct.smtp_tls);
+ const transporter=nodemailer.createTransport({host:acct.smtp_host,port:acct.smtp_port,secure,requireTLS:Boolean(acct.smtp_tls && !secure),tls:{rejectUnauthorized:true},auth:{user:acct.smtp_user,pass:decrypt(acct.smtp_secret_enc)}});
+ const previousId=prior?.internet_message_id||null;
+ const references=[...(String(prior?.references_header||'').match(/<[^>]+>/g)||[]),...(previousId?[previousId]:[])];
+ const subject=/^re:/i.test(c.subject||'')?(c.subject||'Re: Support request'):`Re: ${c.subject||'Support request'}`;
+ const outgoingAttachments=Array.isArray(req.body.attachments)?req.body.attachments:[];
+ if(outgoingAttachments.length>10)throw new Error('Maximum 10 attachments per email.');
+ let totalAttachmentBytes=0;
+ const smtpAttachments=outgoingAttachments.map(att=>{
+  const content=Buffer.from(String(att.contentBase64||''),'base64');
+  totalAttachmentBytes+=content.length;
+  if(!att.fileName||content.length>10*1024*1024||totalAttachmentBytes>20*1024*1024)throw new Error('Each attachment must be under 10 MB and the total must be under 20 MB.');
+  return {filename:String(att.fileName).slice(0,255),content,contentType:String(att.mimeType||'application/octet-stream').slice(0,150)};
+ });
+ let info;try{info=await transporter.sendMail({from:{name:acct.name,address:acct.email_address},to:contact.email,subject,text:body,attachments:smtpAttachments,inReplyTo:previousId||undefined,references:references.length?references:undefined});}catch(sendError){await pool.query("UPDATE messages SET provider_status='failed' WHERE id=$1",[msg.id]);throw sendError;}
+ // Serialize JSONB arrays/objects explicitly; passing a JS array directly makes pg encode it as a PostgreSQL array.
+ await pool.query("INSERT INTO email_messages(message_id,account_id,internet_message_id,in_reply_to,references_header,from_address,to_addresses,subject,reply_to,headers) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10::jsonb)",[msg.id,acct.id,info.messageId||null,previousId,references.join(' ')||null,acct.email_address,JSON.stringify([contact.email]),subject,acct.email_address,JSON.stringify({messageId:info.messageId||null})]);
+ await pool.query('UPDATE messages SET provider_message_id=$2,provider_status=$3,raw_payload=$4 WHERE id=$1',[msg.id,info.messageId,'sent',{accepted:info.accepted,rejected:info.rejected,response:info.response}]);
+ for(let i=0;i<smtpAttachments.length;i++){const att=smtpAttachments[i];await pool.query('INSERT INTO message_attachments(message_id,file_name,mime_type,size_bytes,content,disposition) VALUES($1,$2,$3,$4,$5,$6)',[msg.id,att.filename,att.contentType,att.content.length,att.content,'attachment']);}
 }else{await pool.query('UPDATE messages SET provider_status=$2 WHERE id=$1',[msg.id,'sent']);}await pool.query("UPDATE conversations SET updated_at=now(),last_message_at=now(),status='open' WHERE id=$1",[c.id]);await pool.query("INSERT INTO agent_activity_logs(user_id,action,entity_type,entity_id) VALUES($1,'message.sent','conversation',$2)",[user.id,c.id]);return {ok:true,message:msg};}));
 app.post('/api/conversations/:id/status',requireLogin,api(async req=>{const {user,allowed}=await access(req,'conversation.status');if(!allowed)throw Object.assign(new Error('Permission denied'),{status:403});await assertConversationAccess(req,req.params.id);const status=req.body.status;if(!['open','pending','resolved','closed'].includes(status))throw new Error('Invalid status');const old=(await pool.query('SELECT status FROM conversations WHERE id=$1',[req.params.id])).rows[0];if(!old)throw new Error('Conversation not found');await pool.query('UPDATE conversations SET status=$2,closed_at=CASE WHEN $2 IN (\'resolved\',\'closed\') THEN now() ELSE NULL END,updated_at=now() WHERE id=$1',[req.params.id,status]);await pool.query("INSERT INTO conversation_events(conversation_id,actor_user_id,event_type,old_value,new_value) VALUES($1,$2,'status_changed',$3,$4)",[req.params.id,user.id,{status:old.status},{status}]);await pool.query("INSERT INTO agent_activity_logs(user_id,action,entity_type,entity_id,details) VALUES($1,'conversation.status','conversation',$2,$3)",[user.id,req.params.id,{from:old.status,to:status}]);return {ok:true};}));
 app.get('/api/settings/ui',requireLogin,api(async()=>{const row=(await pool.query("SELECT value FROM system_settings WHERE key='ui_preferences'")).rows[0];return {settings:row?.value||{icon_color:'#dbeafe',icon_background:'#263958',icon_shape:'rounded'}};}));
 app.put('/api/settings/ui',requireLogin,api(async req=>{const {user,allowed}=await access(req,'branding.manage');if(!allowed)throw Object.assign(new Error('Permission denied'),{status:403});const x=req.body||{};const validColor=v=>/^#[0-9a-fA-F]{6}$/.test(v||'');const icons={};for(const id of ['inbox','mine','pool','contacts','teams','agents','admin']){const p=x.icons?.[id]||{};icons[id]={color:validColor(p.color)?p.color:null,background:validColor(p.background)?p.background:null,shape:['rounded','circle','square'].includes(p.shape)?p.shape:null};}const settings={icon_color:validColor(x.icon_color)?x.icon_color:'#dbeafe',icon_background:validColor(x.icon_background)?x.icon_background:'#263958',icon_shape:['rounded','circle','square'].includes(x.icon_shape)?x.icon_shape:'rounded',icons};await pool.query("INSERT INTO system_settings(key,value,updated_by,updated_at) VALUES('ui_preferences',$1,$2,now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_by=EXCLUDED.updated_by,updated_at=now()",[settings,user.id]);return {settings};}));
 app.get('/api/settings/branding',requireLogin,api(async()=>({branding:(await pool.query('SELECT * FROM branding_settings WHERE id=1')).rows[0]})));
 app.put('/api/settings/branding',requireLogin,api(async req=>{const {user,allowed}=await access(req,'branding.manage');if(!allowed)throw new Error('Permission denied');const b=req.body;const row=(await pool.query('UPDATE branding_settings SET company_name=$1,primary_color=$2,secondary_color=$3,footer_text=$4,updated_at=now() WHERE id=1 RETURNING *',[b.company_name||'Mesina Farms',b.primary_color||'#2563eb',b.secondary_color||'#0f172a',b.footer_text||''])).rows[0];await pool.query("INSERT INTO audit_logs(actor_user_id,action,entity_type,entity_id,after_data) VALUES($1,'branding.updated','branding','1',$2)",[user.id,row]);return {branding:row};}));
-
-app.get('/api/settings/email',requireLogin,api(async()=>{
- const accounts=(await pool.query(`SELECT id,name,email_address,imap_host,imap_port,imap_tls,imap_user,smtp_host,smtp_port,smtp_tls,smtp_user,
- folder_name,from_name,reply_to,enabled,last_sync_at,last_sync_error,sync_interval_seconds,created_at,updated_at
- FROM email_accounts ORDER BY created_at`)).rows;
- return {accounts};
-}));
-app.post('/api/settings/email',requireLogin,api(async req=>{
- const {user,allowed}=await access(req,'integrations.manage');if(!allowed)throw Object.assign(new Error('Permission denied'),{status:403});
- const x=req.body||{};
- for(const f of ['name','email_address','imap_host','imap_user','imap_password','smtp_host','smtp_user','smtp_password'])
-  if(!String(x[f]||'').trim())throw Object.assign(new Error(`Missing required field: ${f}`),{status:400});
- const row=(await pool.query(`INSERT INTO email_accounts
- (name,email_address,imap_host,imap_port,imap_tls,imap_user,imap_secret_enc,smtp_host,smtp_port,smtp_tls,smtp_user,smtp_secret_enc,folder_name,from_name,reply_to,enabled,sync_interval_seconds)
- VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
- RETURNING id,name,email_address,enabled`,
- [x.name.trim(),x.email_address.trim().toLowerCase(),x.imap_host.trim(),Number(x.imap_port||993),x.imap_tls!==false,x.imap_user,encrypt(x.imap_password),
- x.smtp_host.trim(),Number(x.smtp_port||587),x.smtp_tls!==false,x.smtp_user,encrypt(x.smtp_password),x.folder_name||'INBOX',x.from_name||null,x.reply_to||null,
- x.enabled!==false,Math.min(3600,Math.max(60,Number(x.sync_interval_seconds||60)))] )).rows[0];
- await pool.query("INSERT INTO audit_logs(actor_user_id,action,entity_type,entity_id,after_data) VALUES($1,'email_account.created','email_account',$2,$3)",[user.id,row.id,row]);
- return {account:row};
-}));
-app.put('/api/settings/email/:id',requireLogin,api(async req=>{
- const {user,allowed}=await access(req,'integrations.manage');if(!allowed)throw Object.assign(new Error('Permission denied'),{status:403});
- const x=req.body||{},old=(await pool.query('SELECT * FROM email_accounts WHERE id=$1',[req.params.id])).rows[0];
- if(!old)throw Object.assign(new Error('Email account not found'),{status:404});
- const row=(await pool.query(`UPDATE email_accounts SET name=$2,email_address=$3,imap_host=$4,imap_port=$5,imap_tls=$6,imap_user=$7,imap_secret_enc=$8,
- smtp_host=$9,smtp_port=$10,smtp_tls=$11,smtp_user=$12,smtp_secret_enc=$13,folder_name=$14,from_name=$15,reply_to=$16,enabled=$17,
- sync_interval_seconds=$18,updated_at=now() WHERE id=$1 RETURNING id,name,email_address,enabled`,
- [req.params.id,x.name||old.name,x.email_address||old.email_address,x.imap_host||old.imap_host,Number(x.imap_port||old.imap_port),
- x.imap_tls===undefined?old.imap_tls:Boolean(x.imap_tls),x.imap_user||old.imap_user,x.imap_password?encrypt(x.imap_password):old.imap_secret_enc,
- x.smtp_host||old.smtp_host,Number(x.smtp_port||old.smtp_port),x.smtp_tls===undefined?old.smtp_tls:Boolean(x.smtp_tls),x.smtp_user||old.smtp_user,
- x.smtp_password?encrypt(x.smtp_password):old.smtp_secret_enc,x.folder_name||old.folder_name,x.from_name??old.from_name,x.reply_to??old.reply_to,
- x.enabled===undefined?old.enabled:Boolean(x.enabled),Math.min(3600,Math.max(60,Number(x.sync_interval_seconds||old.sync_interval_seconds||60)))] )).rows[0];
- await pool.query("INSERT INTO audit_logs(actor_user_id,action,entity_type,entity_id,after_data) VALUES($1,'email_account.updated','email_account',$2,$3)",[user.id,row.id,row]);
- return {account:row};
-}));
-app.delete('/api/settings/email/:id',requireLogin,api(async req=>{
- const {user,allowed}=await access(req,'integrations.manage');if(!allowed)throw Object.assign(new Error('Permission denied'),{status:403});
- const client=await pool.connect();let row;try{await client.query('BEGIN');
- row=(await client.query('SELECT id,name,email_address FROM email_accounts WHERE id=$1 FOR UPDATE',[req.params.id])).rows[0];
- if(!row)throw Object.assign(new Error('Email account not found'),{status:404});
- await client.query('UPDATE email_messages SET account_id=NULL WHERE account_id=$1',[req.params.id]);
- await client.query('UPDATE email_sync_logs SET account_id=NULL WHERE account_id=$1',[req.params.id]);
- await client.query('DELETE FROM email_accounts WHERE id=$1',[req.params.id]);await client.query('COMMIT');
- }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
- await pool.query("INSERT INTO audit_logs(actor_user_id,action,entity_type,entity_id,after_data) VALUES($1,'email_account.deleted','email_account',$2,$3)",[user.id,row.id,row]);return {ok:true};
-}));
-app.post('/api/settings/email/:id/test',requireLogin,api(async req=>{
- const {allowed}=await access(req,'integrations.manage');if(!allowed)throw Object.assign(new Error('Permission denied'),{status:403});
- const a=(await pool.query('SELECT * FROM email_accounts WHERE id=$1',[req.params.id])).rows[0];if(!a)throw Object.assign(new Error('Account not found'),{status:404});
- let imap,transporter;
- try{
-  imap=new ImapFlow({host:a.imap_host,port:a.imap_port,secure:a.imap_tls,auth:{user:a.imap_user,pass:decrypt(a.imap_secret_enc)},logger:false,connectionTimeout:15000});
-  await imap.connect();await imap.mailboxOpen(a.folder_name||'INBOX');await imap.logout();imap=null;
-  transporter=smtpTransport(a);await transporter.verify();
-  await pool.query("INSERT INTO email_sync_logs(account_id,level,message,details) VALUES($1,'info','IMAP and SMTP connection test succeeded',$2)",[a.id,{imap_host:a.imap_host,smtp_host:a.smtp_host}]);
-  return {ok:true,message:'IMAP login, mailbox access and SMTP verification succeeded'};
- }catch(e){
-  await pool.query("INSERT INTO email_sync_logs(account_id,level,message,details) VALUES($1,'error',$2,$3)",[a.id,e.message,{operation:'connection_test'}]).catch(()=>{});
-  throw Object.assign(new Error(`Email connection test failed: ${e.message}`),{status:502});
- }finally{try{await imap?.logout()}catch{}try{transporter?.close()}catch{}}
-}));
+app.get('/api/settings/email',requireLogin,api(async()=>({accounts:(await pool.query('SELECT id,name,email_address,imap_host,imap_port,imap_tls,imap_user,smtp_host,smtp_port,smtp_tls,smtp_user,folder_name,enabled,last_sync_at,last_error,last_uid FROM email_accounts ORDER BY created_at')).rows})));
+app.post('/api/settings/email',requireLogin,api(async req=>{const {user,allowed}=await access(req,'integrations.manage');if(!allowed)throw new Error('Permission denied');const x=req.body;const row=(await pool.query(`INSERT INTO email_accounts(name,email_address,imap_host,imap_port,imap_tls,imap_user,imap_secret_enc,smtp_host,smtp_port,smtp_tls,smtp_user,smtp_secret_enc,folder_name,enabled) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id,name,email_address,enabled`,[x.name,x.email_address,x.imap_host,Number(x.imap_port||993),x.imap_tls!==false,x.imap_user,encrypt(x.imap_password),x.smtp_host,Number(x.smtp_port||587),x.smtp_tls!==false,x.smtp_user,encrypt(x.smtp_password),x.folder_name||'INBOX',x.enabled!==false])).rows[0];await pool.query("INSERT INTO audit_logs(actor_user_id,action,entity_type,entity_id) VALUES($1,'email_account.created','email_account',$2)",[user.id,row.id]);return {account:row};}));
+app.delete('/api/settings/email/:id',requireLogin,api(async req=>{const {user,allowed}=await access(req,'integrations.manage');if(!allowed)throw Object.assign(new Error('Permission denied'),{status:403});const client=await pool.connect();let row;try{await client.query('BEGIN');row=(await client.query('SELECT id,name,email_address FROM email_accounts WHERE id=$1 FOR UPDATE',[req.params.id])).rows[0];if(!row)throw Object.assign(new Error('Email account not found'),{status:404});await client.query('UPDATE email_messages SET account_id=NULL WHERE account_id=$1',[req.params.id]);await client.query('UPDATE email_sync_logs SET account_id=NULL WHERE account_id=$1',[req.params.id]);await client.query('DELETE FROM email_accounts WHERE id=$1',[req.params.id]);await client.query('COMMIT');}catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}await pool.query("INSERT INTO audit_logs(actor_user_id,action,entity_type,entity_id,after_data) VALUES($1,'email_account.deleted','email_account',$2,$3)",[user.id,row.id,row]);return {ok:true};}));
 app.post('/api/settings/email/:id/sync',requireLogin,api(async req=>{
  const {allowed}=await access(req,'integrations.manage');if(!allowed)throw Object.assign(new Error('Permission denied'),{status:403});
- const account=(await pool.query('SELECT id,enabled FROM email_accounts WHERE id=$1',[req.params.id])).rows[0];
- if(!account)throw Object.assign(new Error('Email account not found'),{status:404});
- if(!account.enabled)throw Object.assign(new Error('Enable this mailbox before synchronizing'),{status:400});
- await syncEmailAccounts(req.params.id);
- const latest=(await pool.query('SELECT level,message,created_at FROM email_sync_logs WHERE account_id=$1 ORDER BY created_at DESC LIMIT 1',[account.id])).rows[0];
- return {ok:true,message:latest?.message||'Mailbox synchronization was requested',last_sync:latest||null};
+ const account=(await pool.query('SELECT id FROM email_accounts WHERE id=$1 AND enabled=true',[req.params.id])).rows[0];
+ if(!account)throw Object.assign(new Error('Enabled email account not found'),{status:404});
+ await syncEmailAccountById(account.id);
+ const state=(await pool.query('SELECT last_sync_at,last_error FROM email_accounts WHERE id=$1',[account.id])).rows[0];
+ if(state?.last_error)throw Object.assign(new Error(state.last_error),{status:502});
+ return {ok:true,message:'Mailbox synchronization completed.',...state};
 }));
-app.get('/api/settings/email/logs',requireLogin,api(async req=>{
- const {allowed}=await access(req,'integrations.manage');if(!allowed)throw Object.assign(new Error('Permission denied'),{status:403});
- return (await pool.query(`SELECT l.id,l.level,l.message,l.details,l.created_at,a.name account_name,a.email_address
- FROM email_sync_logs l LEFT JOIN email_accounts a ON a.id=l.account_id ORDER BY l.created_at DESC LIMIT 100`)).rows;
-}));
+app.post('/api/settings/email/:id/test',requireLogin,api(async req=>{const {allowed}=await access(req,'integrations.manage');if(!allowed)throw new Error('Permission denied');const a=(await pool.query('SELECT * FROM email_accounts WHERE id=$1',[req.params.id])).rows[0];if(!a)throw new Error('Account not found');const imap=new ImapFlow({host:a.imap_host,port:a.imap_port,secure:a.imap_tls,auth:{user:a.imap_user,pass:decrypt(a.imap_secret_enc)},logger:false});await imap.connect();await imap.logout();const secure=Boolean(a.smtp_port===465 && a.smtp_tls);const smtp=nodemailer.createTransport({host:a.smtp_host,port:a.smtp_port,secure,requireTLS:Boolean(a.smtp_tls && !secure),tls:{rejectUnauthorized:true},auth:{user:a.smtp_user,pass:decrypt(a.smtp_secret_enc)}});await smtp.verify();return {ok:true,message:'IMAP and SMTP connections successful'};}));
+
 app.get('/api/admin/email-routing',requireLogin,api(async req=>{
  const {user}=await access(req,'inbox.view');const names=(await pool.query('SELECT r.name FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=$1',[user.id])).rows.map(x=>x.name);
  if(!names.some(n=>['Super Admin','Admin'].includes(n)))throw Object.assign(new Error('Permission denied'),{status:403});
@@ -532,11 +432,12 @@ app.use((err,req,res,next)=>{console.error(err);res.status(err.status||500).json
 // IMAP inbound poller. Each mailbox delivery is tracked by account + folder + UIDVALIDITY + UID.
 // Routing is based on the actual To/Cc recipients, never merely on the mailbox being polled.
 let emailSyncBusy=false;
-async function syncEmailAccounts(onlyAccountId=null){
- if(emailSyncBusy||!key.length)return;
+async function syncEmailAccounts(accountId=null){
+ if(emailSyncBusy)return false;
+ if(!key.length)throw new Error('ENCRYPTION_KEY is not configured correctly.');
  emailSyncBusy=true;
  try{
-  const accounts=(await pool.query('SELECT * FROM email_accounts WHERE enabled=true AND ($1::uuid IS NULL OR id=$1::uuid) AND ($1::uuid IS NOT NULL OR last_sync_at IS NULL OR last_sync_at <= now()-make_interval(secs=>sync_interval_seconds)) ORDER BY created_at',[onlyAccountId])).rows;
+  const accounts=(await pool.query('SELECT * FROM email_accounts WHERE enabled=true AND ($1::uuid IS NULL OR id=$1) ORDER BY created_at',[accountId])).rows;
   for(const a of accounts){
    let client;
    try{
@@ -612,10 +513,12 @@ async function syncEmailAccounts(onlyAccountId=null){
         const inserted=(await clientDb.query("INSERT INTO messages(conversation_id,channel,direction,sender_name,sender_address,body_text,body_html,provider_message_id,raw_payload) VALUES($1,'email','inbound',$2,$3,$4,$5,$6,$7) ON CONFLICT(channel,provider_message_id) DO NOTHING RETURNING id",[conversationId,from.name||address,address,parsed.text||'',parsed.html||null,msgId,{messageId:msgId,subject:parsed.subject||''}])).rows[0];
         if(inserted){
          insertedMessageId=inserted.id;
-         await clientDb.query('INSERT INTO email_messages(message_id,account_id,internet_message_id,in_reply_to,references_header,from_address,to_addresses,cc_addresses,subject) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(message_id) DO NOTHING',[inserted.id,a.id,msgId,parsed.inReplyTo||null,(parsed.references||[]).join(' ')||null,address,(parsed.to?.value||[]).map(v=>v.address),(parsed.cc?.value||[]).map(v=>v.address),parsed.subject||'']);
+         // JSONB columns must receive JSON text, not node-postgres' PostgreSQL-array encoding.
+         await clientDb.query('INSERT INTO email_messages(message_id,account_id,internet_message_id,in_reply_to,references_header,from_address,to_addresses,cc_addresses,subject) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9) ON CONFLICT(message_id) DO NOTHING',[inserted.id,a.id,msgId,parsed.inReplyTo||null,(parsed.references||[]).join(' ')||null,address,JSON.stringify((parsed.to?.value||[]).map(v=>v.address)),JSON.stringify((parsed.cc?.value||[]).map(v=>v.address)),parsed.subject||'']);
           for(const attachment of (parsed.attachments||[])){
-           if(!attachment.content||attachment.content.length>20*1024*1024)continue;
-           await persistEmailAttachment(inserted.id,attachment.filename||'email-attachment',attachment.contentType,attachment.content,clientDb);
+           if(!attachment.content||attachment.size>15*1024*1024)continue;
+           await clientDb.query(`INSERT INTO message_attachments(message_id,file_name,mime_type,size_bytes,content,content_id,disposition)
+            VALUES($1,$2,$3,$4,$5,$6,$7)`,[inserted.id,String(attachment.filename||'attachment').slice(0,255),attachment.contentType||'application/octet-stream',attachment.size||attachment.content.length,attachment.content,attachment.contentId||null,attachment.contentDisposition||'attachment']);
           }
          await clientDb.query('UPDATE conversations SET updated_at=now(),last_message_at=now() WHERE id=$1',[conversationId]);
         }else{
@@ -631,18 +534,20 @@ async function syncEmailAccounts(onlyAccountId=null){
      }
     }finally{lock.release();}
     await client.logout();
-    await pool.query("UPDATE email_accounts SET last_sync_at=now(),last_sync_error=NULL,updated_at=now() WHERE id=$1",[a.id]);
-    await pool.query("INSERT INTO email_sync_logs(account_id,level,message,details) VALUES($1,'info','Mailbox synchronization completed',$2)",[a.id,{folder:folder}]);
+    await pool.query('UPDATE email_accounts SET last_sync_at=now(),last_error=NULL,updated_at=now() WHERE id=$1',[a.id]);
    }catch(e){
     console.error(`Email sync ${a.email_address}:`,e.message);
-    await pool.query("UPDATE email_accounts SET last_sync_error=$2,updated_at=now() WHERE id=$1",[a.id,e.message]).catch(()=>{});
-    await pool.query("INSERT INTO email_sync_logs(account_id,level,message,details) VALUES($1,'error',$2,$3)",[a.id,e.message,{operation:'imap_sync'}]).catch(()=>{});
+    await pool.query('UPDATE email_accounts SET last_error=$2,updated_at=now() WHERE id=$1',[a.id,String(e.message).slice(0,2000)]).catch(()=>{});
+    await pool.query("INSERT INTO email_sync_logs(account_id,level,message) VALUES($1,'error',$2)",[a.id,e.message]).catch(()=>{});
     try{await client?.logout();}catch{}
    }
   }
  }catch(e){console.error('Email sync worker:',e.message);}
  finally{emailSyncBusy=false;}
+ return true;
 }
+const syncEmailAccountById=async(id)=>{const completed=await syncEmailAccounts(id);if(!completed)throw new Error('An email synchronization is already running. Please try again shortly.');return completed;};
+setTimeout(()=>syncEmailAccounts().catch(e=>console.error('Initial email sync:',e.message)),15000).unref();
 setInterval(syncEmailAccounts,60000).unref();
 
 // Idempotent compatibility migration for existing persistent databases.
@@ -655,6 +560,13 @@ ALTER TABLE agent_activity_logs ADD COLUMN IF NOT EXISTS public_ipv4 text;
 ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS before_data jsonb;
 ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS after_data jsonb;`);
 await pool.query(`ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS last_uidvalidity text;
+ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS last_sync_at timestamptz;
+ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS last_error text;
+ALTER TABLE email_messages ADD COLUMN IF NOT EXISTS reply_to text;
+ALTER TABLE email_messages ADD COLUMN IF NOT EXISTS headers jsonb NOT NULL DEFAULT '{}';
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS content bytea;
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS content_id text;
+ALTER TABLE message_attachments ADD COLUMN IF NOT EXISTS disposition text;
 CREATE TABLE IF NOT EXISTS email_ingest_receipts (
   account_id uuid NOT NULL REFERENCES email_accounts(id) ON DELETE CASCADE,
   folder_name text NOT NULL,
@@ -665,15 +577,5 @@ CREATE TABLE IF NOT EXISTS email_ingest_receipts (
   PRIMARY KEY(account_id,folder_name,uidvalidity,uid)
 );
 CREATE INDEX IF NOT EXISTS email_ingest_receipts_message_idx ON email_ingest_receipts(message_id);`);
-await pool.query(`ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS from_name text;
-  ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS reply_to text;
-  ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS sync_interval_seconds int NOT NULL DEFAULT 60;
-  ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS last_sync_at timestamptz;
-  ALTER TABLE email_accounts ADD COLUMN IF NOT EXISTS last_sync_error text;
-  ALTER TABLE email_messages ADD COLUMN IF NOT EXISTS internet_message_id text;
-  ALTER TABLE email_messages ADD COLUMN IF NOT EXISTS in_reply_to text;
-  ALTER TABLE email_messages ADD COLUMN IF NOT EXISTS references_header text;
-  CREATE INDEX IF NOT EXISTS email_messages_internet_id_idx ON email_messages(internet_message_id);
-  CREATE INDEX IF NOT EXISTS email_messages_thread_idx ON email_messages(account_id,in_reply_to);`);
 await pool.query('SELECT 1');
-app.listen(PORT,()=>console.log(`Mesina Farms Unified Support v1.02 listening on ${PORT}`));
+app.listen(PORT,()=>console.log(`Mesina Farms Unified Support v1.02.1 listening on ${PORT}`));

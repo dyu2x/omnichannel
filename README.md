@@ -1,34 +1,102 @@
-# Mesina Farms Unified Support v1.01.6
+# Mesina Farms Unified Support v1.02.1
 
-Unified inbox for Email, WhatsApp and website Live Chat, using PostgreSQL, Redis and ZITADEL OIDC.
+Unified customer support inbox for Email (IMAP/SMTP), WhatsApp Cloud API and website Live Chat. Built with Node.js 22, Express, PostgreSQL 16, Redis and ZITADEL OIDC.
+
+## v1.02.1 — Email integration
+
+This release builds on the v1.01.6 fresh-install baseline. It retains the existing ZITADEL login, agent profile/avatar synchronization, local role permissions, unified inbox, contacts, teams, assignment, WhatsApp and Live Chat functionality.
+
+### Email capabilities
+
+- Configure multiple inbound IMAP and outbound SMTP mailboxes from Admin Settings → Email Settings.
+- Separate IMAP and SMTP host, port, username, password and TLS settings.
+- Encrypted-at-rest mailbox credentials using the existing `ENCRYPTION_KEY`.
+- Test IMAP and SMTP connectivity before relying on an account.
+- Automatic inbound mailbox polling every 60 seconds, plus a per-account **Sync now** action.
+- Per-account last synchronization timestamp and last error status.
+- IMAP UID + UIDVALIDITY receipt tracking and database advisory locks to prevent duplicate ingestion across polling cycles and application instances.
+- Email contact matching and automatic contact creation for unknown senders.
+- Email threading using `Message-ID`, `In-Reply-To` and `References`, including multi-reply chains.
+- Replies use the same mailbox that received the conversation whenever possible, and include `In-Reply-To` / `References` headers to keep the customer's email thread together.
+- SMTP TLS behaviour respects the configured security option and port.
+- Inbound attachments are stored in PostgreSQL up to 15 MB each. Outbound email replies support up to 10 attachments, 10 MB per file and 20 MB total.
+- Attachments are only downloadable by agents who can access the parent conversation; downloads use attachment disposition and `nosniff`.
+- Team email routing is based on actual To/Cc recipient addresses, not simply the mailbox being polled.
+- Email account connection and synchronization failures are written to email sync logs and shown in Email Settings.
+
+### Email provider settings examples
+
+Use the values supplied by your email hosting provider. These are examples only.
+
+| Provider type | IMAP | SMTP |
+|---|---|---|
+| Typical SSL/TLS | Port 993, SSL/TLS enabled | Port 465, TLS enabled |
+| Typical STARTTLS | Port 143, STARTTLS option | Port 587, TLS required / STARTTLS |
+
+For SMTP port 587, choose **Require TLS**. For port 465, choose **Require TLS** (implicit TLS is used automatically). Avoid unencrypted connections unless your mail provider explicitly requires them.
+
+### Purelymail recommended settings
+
+| Field | Value |
+|---|---|
+| IMAP host | `imap.purelymail.com` |
+| IMAP port | `993` |
+| IMAP security | SSL/TLS enabled |
+| IMAP username | Full mailbox email address |
+| IMAP folder | `INBOX` |
+| SMTP host | `smtp.purelymail.com` |
+| SMTP port | `465` |
+| SMTP security | TLS enabled (implicit TLS on 465) |
+| SMTP username | Full mailbox email address |
+| Password | Mailbox password, or an app password when 2FA is enabled |
+
+SMTP port `587` with STARTTLS is an alternative if port 465 is blocked. SMTP authentication is required. Do not use a `user+tag@domain` subaddress as the login username.
+
+### v1.02.1 email ingestion correction
+
+The v1.02.0 IMAP ingestion path passed JavaScript arrays directly to PostgreSQL `jsonb` columns. The PostgreSQL driver encoded those values as PostgreSQL arrays, causing `invalid input syntax for type json`. v1.02.1 explicitly serializes `to_addresses`, `cc_addresses`, and outbound email metadata as JSON before insertion. Existing mailbox UIDs that failed before transaction commit remain eligible for a retry; run **Sync now** after upgrading.
 
 ## Fresh installation
 
-1. Copy `.env.example` to `.env`.
-2. Set strong unique values for `SESSION_SECRET`, `ENCRYPTION_KEY` (base64 encoding of exactly 32 random bytes), and `POSTGRES_PASSWORD`.
-3. Keep your existing ZITADEL values unchanged: issuer `https://auth.mesina.farm`, your current web client ID and secret, callback URL `https://support.mesina.farm/callback`, and logout URL `https://support.mesina.farm/`. The callback URL must also remain registered in the same ZITADEL application.
-4. Ensure the ZITADEL application continues to use the same client type, redirect URI, post-logout redirect URI, and scopes as your current deployment. This release does not require changes to ZITADEL configuration.
-5. Start the stack: `docker compose up -d --build`.
-6. Open `https://support.mesina.farm` through your existing Cloudflare Tunnel. The app listens on port 3000 inside Docker. PostgreSQL is bound to `127.0.0.1:5432` for local pgAdmin access; Redis is internal to the Compose network.
-7. Set `BOOTSTRAP_ADMIN_EMAIL` to the exact email address of the administrator who signs in through ZITADEL. On every sign-in, that matching account is guaranteed to have the local Super Admin role, including accounts that already existed before this release. Existing accounts with no local role are automatically assigned Agent. Other users' ZITADEL profile data is synchronized, but their application roles remain local.
+1. Extract this bundle into your application directory.
+2. Copy `.env.example` to `.env`.
+3. Set strong unique values for `SESSION_SECRET`, `ENCRYPTION_KEY` (base64 encoding of exactly 32 random bytes), and `POSTGRES_PASSWORD`.
+4. Keep your current ZITADEL settings if continuing the existing environment: issuer `https://auth.mesina.farm`, current web client ID and secret, callback URL `https://support.mesina.farm/callback`, and logout URL `https://support.mesina.farm/`. No new ZITADEL configuration is required.
+5. Set `BOOTSTRAP_ADMIN_EMAIL` to the exact email address of the intended Super Admin.
+6. Start with `docker compose up -d --build`.
+7. Open `https://support.mesina.farm` through the existing Cloudflare Tunnel. The app listens on port 3000 inside Docker. PostgreSQL is bound to `127.0.0.1:5432`; Redis is internal to the Compose network.
 
-## Important fresh-install warning
+### Important database note
 
-This bundle is intentionally clean and contains no migration scripts. `db/init.sql` is the single initial schema and runs only when PostgreSQL initializes a new, empty data directory. Use a new/empty Docker volume for a fresh install. **Do not delete or replace an existing production database volume unless you have a verified backup and explicitly intend to start with an empty database.** This package is not an in-place upgrade procedure for v1.01.1.
+This is a **fresh-install bundle**. `db/init.sql` is the single consolidated initial PostgreSQL schema. There is no `migrations/` directory and no separate migration files in this ZIP. PostgreSQL runs `db/init.sql` only when initializing a new empty data directory.
+
+Do not delete or replace an existing production PostgreSQL volume to install this package. Back up first and use a separately planned in-place upgrade procedure if upgrading an existing installation. The application retains idempotent startup compatibility checks for known prior schema fields; these are in `src/server.js`, not separate migration files.
 
 ## ZITADEL and local roles
 
-ZITADEL remains the identity provider. Agent display name, avatar and available profile claims are refreshed from ZITADEL when the user signs in. Application roles and `is_active` status are stored locally in PostgreSQL. Super Admin can assign all application roles. Admin can assign Manager and Agent only; only Super Admin can modify Admin/Super Admin accounts.
+ZITADEL remains the identity provider. Agent display name, avatar and available profile claims are refreshed from ZITADEL when the user signs in. Application roles and `is_active` status remain local in PostgreSQL. Super Admin can assign all application roles. Admin can assign Manager and Agent only; only Super Admin can modify Admin/Super Admin accounts.
 
-## WebUI v1.01.6
+## Deployment
 
-- Sidebar can be collapsed to icon-only mode; the choice persists in the browser.
-- WebUI Settings controls sidebar icon foreground color, background color and shape.
-- Sidebar icons have a small randomized movement on pointer hover.
-- Signed-in agent details, application version and logout control appear in the upper-right header.
-- Registered Agents supports local role assignment and active/inactive status.
-- Teams & Assignment supports team name/member updates and team deletion (role restricted).
-- Email Settings supports removing connected inboxes and shows a checkmark for each connected account.
+For a clean fresh install:
+
+```bash
+cp .env.example .env
+# Edit .env and set strong secrets and ZITADEL credentials
+docker compose up -d --build
+docker compose ps
+docker compose logs -f app
+```
+
+For a rebuild after replacing application files, preserve `.env` and the PostgreSQL volume:
+
+```bash
+docker compose build --no-cache app
+docker compose up -d --force-recreate app
+docker compose logs --tail=150 app
+```
+
+Never use `docker compose down -v` unless intentionally deleting all persistent data.
 
 ## Useful commands
 
@@ -39,70 +107,12 @@ docker compose logs -f postgres
 curl -fsS http://127.0.0.1:3000/health
 ```
 
-## Files
+## Package contents
 
-- `db/init.sql` — complete initial PostgreSQL schema
-- `src/server.js` — Express application, ZITADEL OIDC, API and integrations
-- `public/` — WebUI and embeddable Live Chat widget
+- `db/init.sql` — consolidated initial PostgreSQL schema
+- `src/server.js` — Express application, ZITADEL OIDC, APIs and IMAP/SMTP integrations
+- `public/` — WebUI, styles and embeddable Live Chat widget
 - `.env.example` — configuration template
+- `Dockerfile` and `docker-compose.yml` — container build and deployment
 
-
-## v1.01.5 fresh-install notes
-- `db/init.sql` is the consolidated initial schema; it contains no `ALTER TABLE` migration statements.
-- Use a new PostgreSQL volume for a clean installation. This bundle does not migrate or overwrite an existing database.
-- Preserve the current ZITADEL issuer, client ID/secret, callback, logout URL, and registered redirect URIs in `.env`; no ZITADEL application changes are required.
-- Session cookies use a one-hour rolling expiration, so activity renews the session and inactivity expires it.
-- Super Admin database export creates a SQL export and arms operational-data truncation for three minutes. Truncation preserves application configuration, registered users, roles, permissions, and integration settings.
-
-
-## v1.01.5 update notes
-
-- Admin Settings sub-pages include a return button to the Admin Settings selection.
-- Super Admin can import an application-generated SQL export. Import is transactional and restores all application tables (including users, roles, settings and encrypted integration credentials) into the target database, replacing the existing application data; back up first and retain the same ENCRYPTION_KEY for encrypted settings.
-- The operational-data truncate control remains disabled/grey until a successful SQL export arms it, and displays the three-minute authorization countdown.
-- Customer directory deletion is exposed only to Super Admin.
-- Navigation icon colors, backgrounds, and shapes can be configured independently for each navigation section.
-- Activity history records the section, request before/after snapshots where available, and the client public IPv4 when the reverse proxy provides an IPv4 address.
-- Admin Settings includes role restrictions for changing permission grants by role. Super Admin's permissions are fixed.
-- Email Routing lets Admin and Super Admin assign enabled addresses configured in Email Settings to teams. Incoming email received by a routed inbox is assigned to its selected team.
-
-### Upgrade / migration
-
-The application runs idempotent compatibility migrations at startup for the new `teams.routing_email` and activity/audit fields. Keep your existing `.env` and persistent PostgreSQL volume when upgrading. For a fresh install, use the included `docker-compose.yml` and `.env.example`.
-
-
-## v1.01.6 email inbox fixes
-
-- Email team routing now matches each message's actual To/Cc recipients against the configured team routing address. It no longer assigns every message fetched from a mailbox to that mailbox's team.
-- The All Conversations filters continue to combine status, channel, and assigned team as separate filters; selecting Email + Sales now returns email conversations actually assigned to Sales.
-- Email ingestion records each IMAP delivery by account, folder, UIDVALIDITY, and UID, and uses an advisory lock plus the existing message uniqueness constraint to prevent repeat polling and concurrent duplicate inserts.
-- IMAP UIDVALIDITY changes reset the mailbox cursor safely so a mailbox UID reset does not cause stale cursor behaviour.
-- Email replies are matched using any available In-Reply-To / References message IDs, including multi-reply chains, so replies are added to the existing conversation rather than creating a new conversation for each reply.
-- The new email ingestion receipt table is included in SQL export/import and operational-data truncation. Existing PostgreSQL volumes are updated by an idempotent startup migration; keep your existing `.env` and database volume when upgrading.
-
-### Upgrade from v1.01.5
-
-Back up PostgreSQL first, replace the application files with this v1.01.6 bundle, then rebuild and restart the app service. Do not remove the `postgres_data` volume and do not run a fresh-install database reset. The startup migration adds the UIDVALIDITY cursor and receipt table automatically. Existing incorrectly assigned conversations are not automatically reassigned, because the system cannot distinguish old automatic assignments from manual team assignments; review and reassign those existing records in the inbox if needed.
-
-
-## v1.02 — Email integration
-
-This release builds on the existing IMAP ingestion and SMTP reply support.
-
-- Configure IMAP and SMTP independently, including TLS, mailbox folder, sender display name and Reply-To.
-- Edit an existing mailbox without re-entering stored passwords; credentials remain encrypted with AES-256-GCM.
-- Test IMAP authentication and mailbox access plus SMTP transport verification.
-- Manually request mailbox synchronization and review the latest sync logs/errors.
-- Incoming email is deduplicated using mailbox UIDVALIDITY/UID receipts and Internet Message-ID.
-- Email replies prefer the mailbox that received the conversation and include In-Reply-To / References headers for threading.
-- Email account schema upgrades are additive and run at application startup.
-- Existing database volumes and `.env` are retained during upgrades.
-
-### Email provider settings
-
-Typical configurations:
-- IMAP: port 993 with TLS enabled.
-- SMTP submission: port 587 with STARTTLS required.
-- SMTP implicit TLS: port 465 (TLS is enabled automatically based on the port).
-
-Use provider-specific app passwords where applicable. Never expose mailbox passwords in logs or screenshots.
+No migration files are included in this package.

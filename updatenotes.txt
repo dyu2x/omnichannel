@@ -1,0 +1,21 @@
+Mesina Farms Unified Support v1.02.1
+Email JSONB ingestion fix and Purelymail setup preset
+
+FIXES
+- Fixed inbound IMAP ingestion failing with PostgreSQL `invalid input syntax for type json`.
+- Explicitly JSON-serializes inbound To/Cc address arrays before storing in jsonb columns.
+- Explicitly JSON-serializes outbound email recipient arrays and header metadata.
+- Adds explicit jsonb casts to the affected SQL statements.
+- Failed message transactions roll back their IMAP receipt, allowing the same UID to be retried after the fix.
+
+EMAIL CONFIGURATION
+- Adds a Purelymail quick-configuration preset in Admin Settings > Email Settings.
+- Uses imap.purelymail.com:993 with SSL/TLS and INBOX.
+- Uses smtp.purelymail.com:465 with implicit TLS.
+- Automatically uses the full email address as both IMAP and SMTP username when the address is entered/updated.
+
+PACKAGE
+- Full fresh-install source bundle.
+- Single consolidated db/init.sql schema.
+- No migrations directory or standalone migration files.
+- Preserve the existing .env and PostgreSQL volume when upgrading an existing installation.
